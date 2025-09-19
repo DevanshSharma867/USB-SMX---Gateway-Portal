@@ -1,0 +1,1 @@
+# Honeywell SMX Clone - Gateway Service

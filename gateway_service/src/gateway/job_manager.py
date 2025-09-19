@@ -37,7 +37,8 @@ class Job:
 
 class JobManager:
     """Handles the creation and state management of jobs."""
-    def __init__(self):
+    def __init__(self, gui_queue=None):
+        self.gui_queue = gui_queue
         # Ensure the root job directory exists.
         JOB_ROOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -97,20 +98,38 @@ class JobManager:
         }
         self._write_json_atomically(job.path / "state.json", state_payload)
 
+        # Send update to GUI if queue exists
+        if self.gui_queue:
+            self.gui_queue.put({
+                "event": "STATE_UPDATE",
+                "job_id": job.job_id,
+                "state": new_state.value
+            })
+
     def log_event(self, job: Job, event_type: str, data: dict):
         """
         Appends a structured event to the job's logs.jsonl file.
         """
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        log_entry = {
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "data": data
+        }
         try:
-            log_entry = {
-                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                "event_type": event_type,
-                "data": data
-            }
             with open(job.path / "logs.jsonl", 'a') as f:
                 f.write(json.dumps(log_entry) + '\n')
         except Exception as e:
             print(f"Warning: Failed to write to log for job {job.job_id}: {e}")
+
+        # Send update to GUI if queue exists
+        if self.gui_queue:
+            log_message = f"[{timestamp}] {event_type}: {json.dumps(data)}"
+            self.gui_queue.put({
+                "event": "LOG_EVENT",
+                "job_id": job.job_id,
+                "log_message": log_message
+            })
 
     def _write_json_atomically(self, file_path: Path, data: dict):
         """

@@ -12,11 +12,15 @@ class DeviceManager:
     """
     Monitors for USB device insertions and removals, and processes them.
     """
-    def __init__(self):
-        self._job_manager = JobManager()
+    def __init__(self, gui_queue=None):
+        self._job_manager = JobManager(gui_queue)
         self._file_processor = FileProcessor(self._job_manager)
         self._monitoring_thread = None
         self._stop_event = threading.Event()
+        self.gui_queue = gui_queue
+        # Thread-safe mapping of drive letters to active job IDs
+        self.active_jobs_by_drive = {}
+        self.active_jobs_lock = threading.Lock()
 
     def _collect_metadata(self, wmi_connection, volume_obj):
         """Collects metadata for the specified drive volume object using multiple methods."""
@@ -100,6 +104,19 @@ class DeviceManager:
             pythoncom.CoUninitialize()
             return
 
+        # Notify GUI that a new job has started
+        if self.gui_queue:
+            self.gui_queue.put({
+                "event": "NEW_JOB",
+                "job_id": job.job_id,
+                "drive_letter": drive_letter,
+                "job_path": str(job.path)
+            })
+
+        # Track the job as active for this drive
+        with self.active_jobs_lock:
+            self.active_jobs_by_drive[drive_letter] = job.job_id
+
         # 3. Delegate to File Processor
         # The FileProcessor now handles the entire pipeline from this point forward.
         try:
@@ -112,10 +129,20 @@ class DeviceManager:
 
     def _handle_device_removal(self, drive_letter):
         """
-        Handles the logic for a removed device.
+        Handles device removal by notifying the GUI to close the relevant window.
         """
         print(f"Device removed: {drive_letter}")
-        # This could be used to cancel an in-progress job for the removed device.
+        job_id_to_close = None
+        with self.active_jobs_lock:
+            if drive_letter in self.active_jobs_by_drive:
+                job_id_to_close = self.active_jobs_by_drive.pop(drive_letter)
+        
+        if job_id_to_close and self.gui_queue:
+            print(f"Notifying GUI to close window for job {job_id_to_close}")
+            self.gui_queue.put({
+                "event": "DEVICE_REMOVED",
+                "job_id": job_id_to_close
+            })
 
     def _monitor_devices(self):
         """

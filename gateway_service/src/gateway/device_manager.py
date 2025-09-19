@@ -69,8 +69,7 @@ class DeviceManager:
 
     def _handle_device_insertion(self, drive_letter):
         """
-        Handles the entire workflow for a newly inserted device on a regular
-        scan and mount basis, without exclusive locking.
+        Handles metadata collection for a new device and passes the job to the FileProcessor.
         """
         pythoncom.CoInitialize()
         wmi_connection = wmi.WMI()
@@ -94,24 +93,22 @@ class DeviceManager:
         for key, value in metadata.items():
             print(f"  {key}: {value}")
 
-        # 2. Start Job Lifecycle
+        # 2. Initialize Job
         job = self._job_manager.initialize_job(metadata)
         if not job:
             print("Failed to create a job. Aborting.")
             pythoncom.CoUninitialize()
             return
 
-        # 3. Enumerate and Scan Files
-        print("Proceeding with file enumeration and scanning...")
-        clean_files = self._file_processor.enumerate_files(job, f"{drive_letter}\\")
-
-        # 4. Package if clean
-        if job.state != JobState.QUARANTINED and job.state != JobState.FAILED:
-            self._file_processor.package_job(job, clean_files)
-        else:
-            print(f"Job {job.job_id} finished in state {job.state.value}. No package created.")
-
-        pythoncom.CoUninitialize()
+        # 3. Delegate to File Processor
+        # The FileProcessor now handles the entire pipeline from this point forward.
+        try:
+            self._file_processor.process_device(job, f"{drive_letter}\\")
+        except Exception as e:
+            print(f"A critical error occurred in the file processor for job {job.job_id}: {e}")
+            self._job_manager.update_state(job, JobState.FAILED, {"error": f"Critical failure in FileProcessor: {e}"})
+        finally:
+            pythoncom.CoUninitialize()
 
     def _handle_device_removal(self, drive_letter):
         """

@@ -1,265 +1,216 @@
-# Handles file enumeration, sanitization, and malware scanning.
+# Handles file enumeration, policy checks, scanning, and packaging.
 import os
-import ctypes
-import subprocess
-from enum import Enum
-from ctypes import wintypes
+import json
 from pathlib import Path
-from .job_manager import Job, JobState
+from .job_manager import Job, JobState, JobManager
 from .crypto import CryptoManager
 
-# Constants and structures for Windows API calls
-INVALID_HANDLE_VALUE = -1
+# MVP Policy: A simple blacklist of file extensions that are not allowed.
+POLICY_BLACKLIST_EXTENSIONS = {".exe", ".dll", ".bat", ".sh"}
 
-class ScanVerdict(Enum):
-    CLEAN = "CLEAN"
-    INFECTED = "INFECTED"
-    ERROR = "ERROR"
-    TIMEOUT = "TIMEOUT"
-
-class WIN32_FIND_STREAM_DATA(ctypes.Structure):
-    _fields_ = [("StreamSize", wintypes.LARGE_INTEGER),
-                ("cStreamName", wintypes.WCHAR * 296)] # STREAM_NAME_SIZE_STRING
+# MVP Threat: A simple filename to simulate a malware detection.
+THREAT_FILENAME = "eicar.com"
 
 class FileProcessor:
-    """Processes files on the USB device."""
-    def __init__(self, job_manager):
+    """Processes files on a device according to the defined workflow."""
+    def __init__(self, job_manager: JobManager):
         self._job_manager = job_manager
-        self._mp_cmd_run_path = self._find_mp_cmd_run()
+        self._crypto_manager = CryptoManager()
+        self._policies = self._load_policies()
 
-    def _find_mp_cmd_run(self) -> str | None:
-        """
-        Finds the full path to MpCmdRun.exe.
-        Searches common locations for Windows Defender.
-        """
-        print("Searching for MpCmdRun.exe...")
-        # Common paths for the executable
-        possible_paths = [
-            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Windows Defender" / "MpCmdRun.exe",
-            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Windows Defender" / "MpCmdRun.exe",
-        ]
-        
-        # Also check the platform-specific directory which is more common now
-        platform_dir = Path(os.environ.get("ProgramData", "C:/ProgramData")) / "Microsoft" / "Windows Defender" / "Platform"
-        if platform_dir.exists():
-            # Get the latest version directory, e.g., "4.18.2205.7-0"
-            version_dirs = sorted([d for d in platform_dir.iterdir() if d.is_dir()], reverse=True)
-            if version_dirs:
-                possible_paths.append(version_dirs[0] / "MpCmdRun.exe")
-
-        for path in possible_paths:
-            if path.exists():
-                print(f"Found MpCmdRun.exe at: {path}")
-                return str(path)
-        
-        print("MpCmdRun.exe could not be found in standard locations.")
-        return None
-
-    def enumerate_files(self, job: Job, root_path: str) -> list[Path]:
-        """
-        Enumerates all files, detects ADS, scans for malware, and returns a sorted list.
-        """
-        print(f"Starting file enumeration for job {job.job_id} on {root_path}")
-        self._job_manager.update_state(job, JobState.ENUMERATING)
-        
-        all_files = []
-        root = Path(root_path)
-        self._kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-
+    def _load_policies(self) -> list[dict]:
+        """Loads and validates policies from the policy.json file."""
         try:
-            for dirpath, _, filenames in os.walk(root):
-                for filename in filenames:
-                    if job.state == JobState.QUARANTINED:
-                        print("Malware detected, aborting file enumeration.")
-                        return [] # Stop processing immediately
-
-                    full_path = Path(dirpath) / filename
-                    
-                    if self._is_path_safe(full_path, root):
-                        all_files.append(full_path)
-                        
-                        # ADS Check
-                        streams = self._get_alternate_data_streams(full_path)
-                        non_whitelisted_streams = [s for s in streams if s not in [':$DATA', ':Zone.Identifier:$DATA']]
-                        if non_whitelisted_streams:
-                            print(f"[!] Found non-whitelisted ADS in {full_path}: {non_whitelisted_streams}")
-
-                        # Malware Scan
-                        verdict, details = self.scan_file(full_path)
-                        print(f"Scan result for {full_path}: {verdict.name} - {details}")
-                        if verdict == ScanVerdict.INFECTED:
-                            print(f"[!!!] MALWARE DETECTED in {full_path}! Threat: {details}")
-                            self._job_manager.update_state(job, JobState.QUARANTINED)
-                            # The loop will terminate on the next iteration
-                    else:
-                        print(f"[!] Unsafe path detected and skipped: {full_path}")
-
-            if job.state != JobState.QUARANTINED:
-                self._job_manager.update_state(job, JobState.SCANNING) # Or next state
+            policy_path = Path(__file__).parent / "policy.json"
+            with open(policy_path, 'r') as f:
+                policy_data = json.load(f)
             
-            all_files.sort()
-            print(f"Enumerated {len(all_files)} files.")
-            return all_files
+            # Basic validation
+            if 'policies' not in policy_data or not isinstance(policy_data['policies'], list):
+                print("Warning: policy.json is malformed. No policies will be applied.")
+                return []
 
+            # Filter for enabled policies only
+            enabled_policies = [p for p in policy_data['policies'] if p.get('enabled', False)]
+            print(f"Loaded {len(enabled_policies)} enabled policies.")
+            return enabled_policies
+        except FileNotFoundError:
+            print("Warning: policy.json not found. No policies will be applied.")
+            return []
         except Exception as e:
-            print(f"An error occurred during file enumeration: {e}")
-            self._job_manager.update_state(job, JobState.FAILED)
+            print(f"Warning: Failed to load or parse policy.json: {e}")
             return []
 
-    def package_job(self, job: Job, file_list: list[Path]):
+    def process_device(self, job: Job, root_path: str):
         """
-        Encrypts all files and creates the final signed manifest.
+        Orchestrates the entire file processing pipeline for a given job and device.
         """
-        print(f"Starting packaging for job {job.job_id}")
-        self._job_manager.update_state(job, JobState.PACKAGING)
+        try:
+            # 1. File Enumeration
+            self._job_manager.update_state(job, JobState.ENUMERATING)
+            all_files = self._enumerate_files(job, root_path)
+            if all_files is None: return # Enumeration failed
+
+            # 2. Policy Enforcement
+            self._job_manager.update_state(job, JobState.POLICY_CHECK)
+            if not self._enforce_policies(job, all_files):
+                return # Policy violation detected
+
+            # 3. Malware Scanning
+            self._job_manager.update_state(job, JobState.SCANNING)
+            if not self._scan_files(job, all_files):
+                return # Threat detected
+
+            # 4. Cryptographic Packaging
+            self._job_manager.update_state(job, JobState.PACKAGING)
+            self._package_job(job, all_files)
+
+            # 5. Finalize Job
+            self._job_manager.update_state(job, JobState.SUCCESS, {"detail": f"Job completed successfully. {len(all_files)} files processed."})
+            print(f"Job {job.job_id} completed successfully!")
+
+        except Exception as e:
+            print(f"An unhandled error occurred during job {job.job_id}: {e}")
+            self._job_manager.update_state(job, JobState.FAILED, {"error": str(e)})
+
+    def _enumerate_files(self, job: Job, root_path: str) -> list[Path] | None:
+        """Enumerates all files from the root path, returning a sorted list."""
+        self._job_manager.log_event(job, "ENUMERATION_START", {"root_path": root_path})
+        all_files = []
+        try:
+            for dirpath, _, filenames in os.walk(root_path):
+                for filename in filenames:
+                    full_path = Path(dirpath) / filename
+                    all_files.append(full_path)
+            
+            all_files.sort()
+            self._job_manager.log_event(job, "ENUMERATION_COMPLETE", {"file_count": len(all_files)})
+            return all_files
+        except Exception as e:
+            self._job_manager.update_state(job, JobState.FAILED, {"error": f"File enumeration failed: {e}"})
+            return None
+
+    def _enforce_policies(self, job: Job, file_list: list[Path]) -> bool:
+        """Checks files against defined policies. Returns False if a violation occurs."""
+        self._job_manager.log_event(job, "POLICY_CHECK_START", {"policy_count": len(self._policies)})
         
-        crypto_manager = CryptoManager()
-        cek = crypto_manager.generate_cek()
+        # A map of policy types to their handler methods
+        policy_handlers = {
+            "fileExtensionBlacklist": self._policy_file_extension_blacklist,
+            "maxFileSize": self._policy_max_file_size
+        }
+
+        for policy in self._policies:
+            handler = policy_handlers.get(policy['type'])
+            if not handler:
+                self._job_manager.log_event(job, "POLICY_EVAL_WARN", {"policy_id": policy.get('id'), "reason": "No handler found for policy type."})
+                continue
+
+            self._job_manager.log_event(job, "POLICY_EVAL_START", {"policy_id": policy.get('id'), "policy_name": policy.get('name')})
+            if not handler(job, file_list, policy):
+                # The handler is responsible for setting the job state and logging the specific failure
+                return False
+
+        return True
+
+    def _policy_file_extension_blacklist(self, job: Job, file_list: list[Path], policy: dict) -> bool:
+        """Handler for the fileExtensionBlacklist policy."""
+        blacklisted_extensions = set(policy.get('parameters', {}).get('extensions', []))
+        if not blacklisted_extensions:
+            return True # Nothing to check
+
+        for file_path in file_list:
+            if file_path.suffix.lower() in blacklisted_extensions:
+                details = {
+                    "policy_id": policy.get('id'),
+                    "file_path": str(file_path),
+                    "reason": f"File extension '{file_path.suffix}' is blacklisted."
+                }
+                self._job_manager.update_state(job, JobState.FAILED_POLICY, details)
+                return False
+        return True
+
+    def _policy_max_file_size(self, job: Job, file_list: list[Path], policy: dict) -> bool:
+        """Handler for the maxFileSize policy."""
+        max_size_mb = policy.get('parameters', {}).get('max_size_mb')
+        if not max_size_mb:
+            return True # Nothing to check
         
-        # Create a directory for the encrypted data blobs
+        max_size_bytes = max_size_mb * 1024 * 1024
+
+        for file_path in file_list:
+            try:
+                file_size = os.path.getsize(file_path)
+                if file_size > max_size_bytes:
+                    details = {
+                        "policy_id": policy.get('id'),
+                        "file_path": str(file_path),
+                        "file_size_mb": round(file_size / (1024*1024), 2),
+                        "reason": f"File size ({round(file_size / (1024*1024), 2)} MB) exceeds the limit of {max_size_mb} MB."
+                    }
+                    self._job_manager.update_state(job, JobState.FAILED_POLICY, details)
+                    return False
+            except OSError as e:
+                # Could fail if the file is deleted during processing, etc.
+                self._job_manager.log_event(job, "POLICY_EVAL_WARN", {"policy_id": policy.get('id'), "reason": f"Could not get size of file {file_path}: {e}"})
+        return True
+
+    def _scan_files(self, job: Job, file_list: list[Path]) -> bool:
+        """(MVP) Simulates scanning files for threats. Returns False if a threat is found."""
+        self._job_manager.log_event(job, "SCANNING_START", {"scanner": "MVP_SIMULATED_SCANNER"})
+        for file_path in file_list:
+            if file_path.name.lower() == THREAT_FILENAME:
+                details = {
+                    "file_path": str(file_path),
+                    "threat_name": "SIMULATED_EICAR_TEST_FILE"
+                }
+                self._job_manager.update_state(job, JobState.QUARANTINED, details)
+                return False
+        return True
+
+    def _package_job(self, job: Job, file_list: list[Path]):
+        """Encrypts files and creates the final manifest."""
+        self._job_manager.log_event(job, "PACKAGING_START", {"algorithm": "AES-256-GCM"})
+        
+        cek = self._crypto_manager.generate_cek()
+        self._crypto_manager.save_cek_to_disk(cek, job.path / "cek.key") # Insecure, for MVP only
+
         data_dir = job.path / "data"
         data_dir.mkdir()
         
         file_manifest_data = {}
 
         for file_path in file_list:
-            print(f"Encrypting {file_path}...")
-            encrypted_data = crypto_manager.encrypt_file(file_path, cek)
+            encrypted_data = self._crypto_manager.encrypt_file(file_path, cek)
             if not encrypted_data:
-                print(f"[!] Failed to encrypt {file_path}. Aborting job.")
-                self._job_manager.update_state(job, JobState.FAILED)
-                return
+                raise RuntimeError(f"Failed to encrypt {file_path}")
 
             ciphertext, nonce, tag = encrypted_data
             
-            # Use the hash of the original file path to create a unique, sanitized filename
-            # This avoids issues with long paths or special characters in the job directory.
-            file_hash = crypto_manager.get_sha256_hash(str(file_path).encode('utf-8'))
+            file_hash = self._crypto_manager.get_sha256_hash(str(file_path).encode('utf-8'))
             encrypted_file_path = data_dir / file_hash
             
             with open(encrypted_file_path, 'wb') as f:
                 f.write(ciphertext)
 
             file_manifest_data[str(file_path)] = {
-                "encrypted_blob_path": str(encrypted_file_path.name),
-                "sha256_encrypted": crypto_manager.get_sha256_hash(ciphertext),
+                "encrypted_blob_name": file_hash,
+                "sha256_encrypted": self._crypto_manager.get_sha256_hash(ciphertext),
                 "nonce": nonce.hex(),
                 "tag": tag.hex()
             }
 
-        # Create and sign the manifest
-        manifest = crypto_manager.create_manifest(job, file_manifest_data)
-        signed_manifest = crypto_manager.sign_manifest_with_vault(manifest)
-        
-        # Write the final manifest to the job directory
-        self._job_manager.update_state(job, JobState.SUCCESS, {"manifest": signed_manifest})
-        
-        print(f"Job {job.job_id} completed successfully!")
+        # Create the final manifest
+        manifest = {
+            "job_id": job.job_id,
+            "file_count": len(file_list),
+            "encryption_algorithm": "AES-256-GCM",
+            "files": file_manifest_data
+        }
+        self._write_json(job.path / "manifest.json", manifest)
+        self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json"})
 
-    def scan_file(self, file_path: Path) -> tuple[ScanVerdict, str]:
-        """
-        Scans a file with Microsoft Defender and ClamAV.
-        Returns a verdict and a details string.
-        """
-        # 1. Microsoft Defender Scan
-        if self._mp_cmd_run_path:
-            try:
-                # Using -ScanType 3 for custom scan on a single file.
-                # -DisableRemediation keeps Defender from automatically deleting the file.
-                result = subprocess.run(
-                    [self._mp_cmd_run_path, "-Scan", "-ScanType", "3", "-File", str(file_path), "-DisableRemediation"],
-                    capture_output=True, text=True, timeout=120, check=True
-                )
-                if "Threats found: 0" in result.stdout:
-                    pass # Clean, proceed to next scanner
-                else:
-                    # Extract threat name
-                    threat_name = "Unknown"
-                    for line in result.stdout.splitlines():
-                        if "Threat " in line:
-                            threat_name = line.split("Threat ")[1].strip()
-                            break
-                    return (ScanVerdict.INFECTED, f"Defender: {threat_name}")
-            except subprocess.TimeoutExpired:
-                return (ScanVerdict.TIMEOUT, "Defender scan timed out.")
-            except subprocess.CalledProcessError as e:
-                # MpCmdRun exits with a non-zero code even when threats are found.
-                # We need to parse the output to be sure.
-                if "Threats found: 0" not in e.stdout:
-                     return (ScanVerdict.INFECTED, f"Defender: Threat detected (parsing output)")
-                print(f"Defender scan error for {file_path}: {e.stderr}")
-                # Don't return ERROR yet, let ClamAV try.
-        else:
-            print("MpCmdRun.exe path not found. Skipping Defender scan.")
-        
-        # 2. ClamAV Scan (if Defender found nothing)
-        try:
-            result = subprocess.run(
-                ["clamscan.exe", "--no-summary", str(file_path)],
-                capture_output=True, text=True, timeout=120, check=True
-            )
-            if result.stdout.strip().endswith("OK"):
-                return (ScanVerdict.CLEAN, "Clean")
-            else:
-                threat_name = result.stdout.strip().split(": ")[1]
-                return (ScanVerdict.INFECTED, f"ClamAV: {threat_name}")
-        except FileNotFoundError:
-            print("clamscan.exe not found. Skipping ClamAV scan.")
-            return (ScanVerdict.CLEAN, "Scanners not found") # Default to clean if no scanners are available
-        except subprocess.TimeoutExpired:
-            return (ScanVerdict.TIMEOUT, "ClamAV scan timed out.")
-        except subprocess.CalledProcessError as e:
-            # Clamscan exits 1 if a virus is found.
-            if e.returncode == 1:
-                threat_name = e.stdout.strip().split(": ")[1]
-                return (ScanVerdict.INFECTED, f"ClamAV: {threat_name}")
-            else:
-                print(f"ClamAV scan error for {file_path}: {e.stderr}")
-                return (ScanVerdict.ERROR, f"ClamAV error (code {e.returncode})")
-
-        return (ScanVerdict.CLEAN, "Clean")
-
-    def _get_alternate_data_streams(self, file_path: Path) -> list[str]:
-        """
-        Uses the Windows API to find all data streams for a file.
-        Returns a list of stream names (e.g., [':$DATA', ':Zone.Identifier:$DATA']).
-        """
-        stream_data = WIN32_FIND_STREAM_DATA()
-        streams = []
-        
-        find_handle = self._kernel32.FindFirstStreamW(
-            ctypes.c_wchar_p(str(file_path)),
-            0, # InfoLevel: FindStreamInfoStandard
-            ctypes.byref(stream_data),
-            0 # dwFlags
-        )
-
-        if find_handle == INVALID_HANDLE_VALUE:
-            return []
-
-        try:
-            while True:
-                streams.append(stream_data.cStreamName)
-                
-                if not self._kernel32.FindNextStreamW(find_handle, ctypes.byref(stream_data)):
-                    break
-        finally:
-            self._kernel32.FindClose(find_handle)
-            
-        # The stream name is in the format :<name>:$<type>
-        # We return the full name for accurate identification.
-        return [s for s in streams if s]
-
-    def _is_path_safe(self, path: Path, root: Path) -> bool:
-        """
-        Validates that the path is safe and does not attempt traversal.
-        It ensures the resolved path is still within the root directory.
-        """
-        try:
-            # Resolving the path will handle ".." traversal.
-            # Path.is_relative_to() is available in Python 3.9+
-            # For broader compatibility, we check if the root is a parent.
-            return root in path.resolve().parents or root == path.resolve().parent
-        except Exception:
-            # Path resolution can fail for various reasons (e.g., invalid characters)
-            return False
+    def _write_json(self, file_path: Path, data: dict):
+        """Writes a dictionary to a JSON file."""
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=4)

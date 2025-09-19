@@ -72,7 +72,14 @@ def main():
 
         try:
             # Reconstruct the full path for the output file
-            relative_path = original_path.relative_to(original_path.anchor)
+            # This logic handles both absolute paths (like C:\...) and relative paths
+            if original_path.is_absolute():
+                # For absolute paths, strip the drive/anchor to make it relative
+                # e.g., C:\Users\Test\file.txt -> Users\Test\file.txt
+                relative_path = original_path.relative_to(original_path.anchor)
+            else:
+                relative_path = original_path
+
             output_file_path = output_dir / relative_path
             output_file_path.parent.mkdir(parents=True, exist_ok=True)
 

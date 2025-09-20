@@ -22,6 +22,25 @@ class DeviceManager:
         self.active_jobs_by_drive = {}
         self.active_jobs_lock = threading.Lock()
 
+        # Rate limiting for device processing
+        self._last_processed_time = {}
+        self.rate_limit_seconds = 30 # Default rate limit: 30 seconds
+
+    def _is_rate_limited(self, device_id: str) -> bool:
+        """
+        Checks if a device is currently rate-limited.
+        Returns True if rate-limited, False otherwise.
+        """
+        current_time = time.time()
+        last_time = self._last_processed_time.get(device_id)
+
+        if last_time and (current_time - last_time < self.rate_limit_seconds):
+            print(f"Device {device_id} is rate-limited. Skipping processing.")
+            return True
+        
+        self._last_processed_time[device_id] = current_time
+        return False
+
     def _collect_metadata(self, wmi_connection, volume_obj):
         """Collects metadata for the specified drive volume object using multiple methods."""
         disk_drive = None
@@ -78,6 +97,16 @@ class DeviceManager:
         pythoncom.CoInitialize()
         wmi_connection = wmi.WMI()
         print(f"Device inserted: {drive_letter}")
+
+        # Check for rate limiting first
+        # We need a unique identifier for the device, not just the drive letter.
+        # For now, we'll use the drive_letter as a proxy for device_id for rate limiting.
+        # A more robust solution would involve getting the actual device's unique ID (e.g., serial number).
+        # However, getting the serial number requires collecting metadata, which is part of the process we might want to rate limit.
+        # So, for this MVP, we'll rate limit based on drive_letter.
+        if self._is_rate_limited(drive_letter):
+            pythoncom.CoUninitialize()
+            return
 
         try:
             volume = wmi_connection.Win32_Volume(DriveLetter=drive_letter)[0]
@@ -145,17 +174,14 @@ class DeviceManager:
             })
 
     def _monitor_devices(self):
-        """
-        Monitors for USB device insertions and removals by polling for drive letters.
-        """
         pythoncom.CoInitialize()
-        wmi_connection = wmi.WMI()
         print("Starting USB device monitor (polling mode)...")
         
-        known_volumes = {v.DeviceID: v.DriveLetter for v in wmi_connection.Win32_Volume() if v.DriveLetter}
+        known_volumes = {}
 
         while not self._stop_event.is_set():
             try:
+                wmi_connection = wmi.WMI()
                 current_volumes = {v.DeviceID: v.DriveLetter for v in wmi_connection.Win32_Volume() if v.DriveLetter}
                 
                 current_device_ids = set(current_volumes.keys())

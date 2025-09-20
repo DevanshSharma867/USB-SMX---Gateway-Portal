@@ -144,6 +144,9 @@ gateway_service/jobs/*/manifest.json
 gateway_service/jobs/*/metadata.json
 gateway_service/jobs/*/state.json
 
+# Keys
+gateway_service/src/gateway/keys/*
+
 # Keep the jobs directory structure but ignore contents
 gateway_service/jobs/*/
 

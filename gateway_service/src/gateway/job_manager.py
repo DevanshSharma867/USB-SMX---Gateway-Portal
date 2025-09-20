@@ -29,11 +29,19 @@ class Job:
     """Represents a single processing job."""
     job_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     state: JobState = JobState.INITIALIZED
+    _path: Path = field(default=None, init=False)
     
     @property
     def path(self) -> Path:
         """The directory where the job's data is stored."""
-        return JOB_ROOT_DIR / self.job_id
+        if self._path is None:
+            return JOB_ROOT_DIR / self.job_id
+        return self._path
+    
+    @path.setter
+    def path(self, value: Path):
+        """Set the job path (for testing purposes)."""
+        self._path = value
 
 class JobManager:
     """Handles the creation and state management of jobs."""

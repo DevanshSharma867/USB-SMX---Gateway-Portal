@@ -49,7 +49,17 @@ class AgentFileProcessor:
         # 3. Decrypt Files
         self._send_status(gui_queue, job_path_str, "DECRYPTING")
         output_path.mkdir(parents=True, exist_ok=True)
+        self._send_log(gui_queue, job_path_str, f"Decrypting files to: {output_path.absolute()}")
         for original_path, file_info in manifest["files"].items():
+            # Skip system files and cek.key file
+            if (original_path.endswith("cek.key") or 
+                original_path.lower().endswith("desktop.ini") or
+                original_path.lower().endswith("thumbs.db") or
+                original_path.startswith("$") or
+                original_path.lower() in [".ds_store", ".spotlight-v100", ".trashes", ".fseventsd"]):
+                self._send_log(gui_queue, job_path_str, f"Skipping {original_path} (system file)...")
+                continue
+                
             encrypted_blob_name = file_info["encrypted_blob_name"]
             encrypted_file_path = data_path / encrypted_blob_name
             nonce = bytes.fromhex(file_info["nonce"])
@@ -59,12 +69,24 @@ class AgentFileProcessor:
             plaintext = self.crypto_manager.decrypt_file(encrypted_file_path, cek, nonce, tag)
 
             if plaintext:
-                # Recreate the original directory structure
-                decrypted_file_path = output_path / Path(original_path).name
-                decrypted_file_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                with open(decrypted_file_path, 'wb') as f:
-                    f.write(plaintext)
+                try:
+                    # Recreate the original directory structure (similar to decrypt_job.py)
+                    original_path_obj = Path(original_path)
+                    if original_path_obj.is_absolute():
+                        relative_path = original_path_obj.relative_to(original_path_obj.anchor)
+                    else:
+                        relative_path = original_path_obj
+                    
+                    decrypted_file_path = output_path / relative_path
+                    decrypted_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    with open(decrypted_file_path, 'wb') as f:
+                        f.write(plaintext)
+                    self._send_log(gui_queue, job_path_str, f"  -> Decrypted successfully to {decrypted_file_path}")
+                except Exception as e:
+                    self._send_log(gui_queue, job_path_str, f"  -> ERROR writing file {original_path}: {e}")
+                    self._send_status(gui_queue, job_path_str, "FAILED")
+                    return
             else:
                 self._send_log(gui_queue, job_path_str, f"Failed to decrypt {original_path}")
                 self._send_status(gui_queue, job_path_str, "FAILED")

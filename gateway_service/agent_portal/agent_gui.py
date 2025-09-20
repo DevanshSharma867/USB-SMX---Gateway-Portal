@@ -84,8 +84,10 @@ class GuiManager:
                         window = AgentGUI(self.root, job_path, drive_letter)
                         self.job_windows[job_path] = window
                         # Automatically start decryption in a new thread
+                        # Create output folder on the USB drive
+                        usb_output_path = Path(f"{drive_letter}\\agent_output")
                         threading.Thread(target=self.file_processor.process_encrypted_job, 
-                                         args=(Path(job_path), Path.home() / "Desktop" / f"{Path(job_path).name}_decrypted", self.msg_queue, job_path)).start()
+                                         args=(Path(job_path), usb_output_path, self.msg_queue, job_path)).start()
 
                 elif event_type == "LOG_EVENT":
                     if job_path in self.job_windows:

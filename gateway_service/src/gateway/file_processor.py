@@ -245,15 +245,19 @@ class FileProcessor:
                 "tag": tag.hex()
             }
 
-        # Create the final manifest (still written locally for auditing)
-        manifest = {
-            "job_id": job.job_id,
-            "file_count": len(file_list),
-            "encryption_algorithm": "AES-256-GCM",
-            "pendrive_output_path": str(pendrive_output_dir),
-            "files": file_manifest_data
-        }
-        self._write_json(job.path / "manifest.json", manifest)
+        # Create the final manifest
+        manifest = self._crypto_manager.create_manifest(
+            job, 
+            file_manifest_data, 
+            file_count=len(file_list),
+            pendrive_output_path=str(pendrive_output_dir)
+        )
+        
+        # Sign the manifest
+        signed_manifest = self._crypto_manager.sign_manifest(manifest)
+        
+        # Write the signed manifest locally for auditing
+        self._write_json(job.path / "manifest.json", signed_manifest)
         self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json", "pendrive_output": str(pendrive_output_dir)})
 
     def package_job(self, job: Job, file_list: list[Path]):
@@ -271,11 +275,10 @@ class FileProcessor:
         Returns (verdict, details) tuple.
         """
         # Try Microsoft Defender first
-        try:
-            defender_path = self._find_mp_cmd_run()
-            if defender_path:
+        if self._mp_cmd_run_path:
+            try:
                 result = subprocess.run([
-                    defender_path, '-Scan', '-ScanType', '3', '-File', str(file_path)
+                    self._mp_cmd_run_path, '-Scan', '-ScanType', '3', '-File', str(file_path)
                 ], capture_output=True, text=True, timeout=120)
                 
                 if "Threat found:" in result.stdout or "Threats found:" in result.stdout:
@@ -290,20 +293,22 @@ class FileProcessor:
                         return ScanVerdict.INFECTED, f"Defender: {result.stdout.strip()}"
                     else:
                         return ScanVerdict.ERROR, f"Defender error: {result.stderr.strip()}"
-        except FileNotFoundError:
-            # Defender not found, try ClamAV
-            pass
-        except subprocess.TimeoutExpired:
-            return ScanVerdict.TIMEOUT, "Defender scan timed out"
-        except subprocess.CalledProcessError as e:
-            if "Threats found: 0" in e.stdout:
-                return ScanVerdict.CLEAN, f"Defender: {e.stdout}"
-            elif "Threats found:" in e.stdout and "Threats found: 0" not in e.stdout:
-                return ScanVerdict.INFECTED, f"Defender: {e.stdout}"
-            else:
-                return ScanVerdict.ERROR, f"Defender error (code {e.returncode}): {e.stderr}"
-        except Exception as e:
-            return ScanVerdict.ERROR, f"Defender error: {str(e)}"
+            except FileNotFoundError:
+                # This should ideally not happen if _mp_cmd_run_path was found
+                pass
+            except subprocess.TimeoutExpired:
+                return ScanVerdict.TIMEOUT, "Defender scan timed out"
+            except subprocess.CalledProcessError as e:
+                if "Threats found: 0" in e.stdout:
+                    return ScanVerdict.CLEAN, f"Defender: {e.stdout}"
+                elif "Threats found:" in e.stdout and "Threats found: 0" not in e.stdout:
+                    return ScanVerdict.INFECTED, f"Defender: {e.stdout}"
+                else:
+                    return ScanVerdict.ERROR, f"Defender error (code {e.returncode}): {e.stderr}"
+            except Exception as e:
+                return ScanVerdict.ERROR, f"Defender error: {str(e)}"
+        else:
+            print("MpCmdRun.exe path not found. Skipping Defender scan.")
         
         # Try ClamAV as fallback
         try:

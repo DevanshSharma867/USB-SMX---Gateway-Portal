@@ -1,11 +1,35 @@
 # Manages cryptographic operations like encryption and signing.
 import os
 import hashlib
+import json
+import datetime
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
 
 class CryptoManager:
     """Handles encryption, hashing, and digital signing."""
+
+    def __init__(self):
+        self._private_key = self._load_private_key()
+
+    def _load_private_key(self) -> ed25519.Ed25519PrivateKey | None:
+        """Loads the Ed25519 private key from the filesystem."""
+        private_key_path = Path(__file__).parent / "keys" / "gateway_private_key.pem"
+        if not private_key_path.exists():
+            print("FATAL: Gateway private key not found. Please run generate_gateway_key.py")
+            return None
+        try:
+            with open(private_key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(),
+                    password=None
+                )
+            return private_key
+        except Exception as e:
+            print(f"FATAL: Failed to load private key: {e}")
+            return None
 
     def generate_cek(self, key_size_bytes: int = 32) -> bytes:
         """Generates a cryptographically secure Content Encryption Key (CEK)."""
@@ -50,13 +74,15 @@ class CryptoManager:
         sha256.update(data)
         return sha256.hexdigest()
 
-    def create_manifest(self, job, file_metadata: dict) -> dict:
+    def create_manifest(self, job, file_metadata: dict, file_count: int = None, pendrive_output_path: str = None) -> dict:
         """
         Creates the job manifest.
         
         Args:
             job: The job object.
             file_metadata: A dictionary mapping file paths to their metadata (hash, etc.).
+            file_count: Total number of files processed.
+            pendrive_output_path: Path where encrypted files are stored on the pendrive.
         
         Returns:
             A dictionary representing the manifest.
@@ -64,6 +90,9 @@ class CryptoManager:
         print(f"Creating manifest for job {job.job_id}")
         manifest = {
             "job_id": job.job_id,
+            "file_count": file_count or len(file_metadata),
+            "encryption_algorithm": "AES-256-GCM",
+            "pendrive_output_path": pendrive_output_path or "N/A",
             "gateway_info": {
                 # This would come from the device metadata collected earlier
             },
@@ -75,18 +104,27 @@ class CryptoManager:
         }
         return manifest
 
-    def sign_manifest_with_vault(self, manifest: dict) -> dict:
+    def sign_manifest(self, manifest: dict) -> dict:
         """
-        (Placeholder) Signs the manifest using HashiCorp Vault.
-        In a real implementation, this would make a call to the Vault PKI engine.
+        Signs the manifest using the gateway's Ed25519 private key.
         """
-        print("Signing manifest with Vault (placeholder)...")
-        # This would be replaced with an actual call to hvac library
+        if not self._private_key:
+            print("Cannot sign manifest: Private key not loaded.")
+            return manifest
+
+        print("Signing manifest with gateway key...")
+        
+        # Create a canonical (sorted, no whitespace) JSON string for signing
+        # This ensures the signature is consistent regardless of key order
+        canonical_manifest = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        
+        signature = self._private_key.sign(canonical_manifest)
+        
         signed_manifest = manifest.copy()
         signed_manifest["signature"] = {
-            "signer": "vault-pki-intermediate",
-            "value": "(placeholder-ed25519-signature)",
-            "timestamp": "(placeholder-timestamp)"
+            "signer": "gateway",
+            "value": signature.hex(),
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
         }
         print("Manifest signed.")
         return signed_manifest

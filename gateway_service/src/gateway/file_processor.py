@@ -211,6 +211,7 @@ class FileProcessor:
         pendrive_output_dir = Path(f"{drive_letter}/.gateway_output")
         pendrive_data_dir = pendrive_output_dir / "data"
         pendrive_cek_path = pendrive_output_dir / "cek.key"
+        pendrive_manifest_path = pendrive_output_dir / "manifest.json"
 
         try:
             pendrive_data_dir.mkdir(parents=True, exist_ok=True)
@@ -256,8 +257,10 @@ class FileProcessor:
         # Sign the manifest
         signed_manifest = self._crypto_manager.sign_manifest(manifest)
         
-        # Write the signed manifest locally for auditing
+        # Write the signed manifest locally for auditing and to the pendrive
         self._write_json(job.path / "manifest.json", signed_manifest)
+        self._write_json(pendrive_manifest_path, signed_manifest)
+
         self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json", "pendrive_output": str(pendrive_output_dir)})
 
     def package_job(self, job: Job, file_list: list[Path]):

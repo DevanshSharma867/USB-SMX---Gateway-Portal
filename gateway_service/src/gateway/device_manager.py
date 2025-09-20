@@ -149,7 +149,7 @@ class DeviceManager:
         # 3. Delegate to File Processor
         # The FileProcessor now handles the entire pipeline from this point forward.
         try:
-            self._file_processor.process_device(job, f"{drive_letter}\\")
+            self._file_processor.process_device(job, f"{drive_letter}\\", drive_letter)
         except Exception as e:
             print(f"A critical error occurred in the file processor for job {job.job_id}: {e}")
             self._job_manager.update_state(job, JobState.FAILED, {"error": f"Critical failure in FileProcessor: {e}"})

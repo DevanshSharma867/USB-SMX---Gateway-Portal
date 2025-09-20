@@ -26,6 +26,7 @@ class FileProcessor:
         self._job_manager = job_manager
         self._crypto_manager = CryptoManager()
         self._policies = self._load_policies()
+        self._mp_cmd_run_path = None # Initialize to None
         # Initialize Windows API for ADS detection
         try:
             import ctypes
@@ -56,7 +57,7 @@ class FileProcessor:
             print(f"Warning: Failed to load or parse policy.json: {e}")
             return []
 
-    def process_device(self, job: Job, root_path: str):
+    def process_device(self, job: Job, root_path: str, drive_letter: str):
         """
         Orchestrates the entire file processing pipeline for a given job and device.
         """
@@ -78,7 +79,7 @@ class FileProcessor:
 
             # 4. Cryptographic Packaging
             self._job_manager.update_state(job, JobState.PACKAGING)
-            self._package_job(job, all_files)
+            self._package_job(job, all_files, drive_letter)
 
             # 5. Finalize Job
             self._job_manager.update_state(job, JobState.SUCCESS, {"detail": f"Job completed successfully. {len(all_files)} files processed."})
@@ -175,27 +176,48 @@ class FileProcessor:
         return True
 
     def _scan_files(self, job: Job, file_list: list[Path]) -> bool:
-        """(MVP) Simulates scanning files for threats. Returns False if a threat is found."""
-        self._job_manager.log_event(job, "SCANNING_START", {"scanner": "MVP_SIMULATED_SCANNER"})
+        """Performs actual scanning of files for threats. Returns False if a threat is found or an error occurs."""
+        self._job_manager.log_event(job, "SCANNING_START", {"scanner": "Windows Defender/ClamAV"})
+        
+        # Initialize MpCmdRun.exe path if not already done
+        if not self._mp_cmd_run_path:
+            self._mp_cmd_run_path = self._find_mp_cmd_run()
+
         for file_path in file_list:
-            if file_path.name.lower() == THREAT_FILENAME:
-                details = {
-                    "file_path": str(file_path),
-                    "threat_name": "SIMULATED_EICAR_TEST_FILE"
-                }
-                self._job_manager.update_state(job, JobState.QUARANTINED, details)
-                return False
+            self._job_manager.log_event(job, "SCANNING_FILE", {"file": str(file_path)})
+            verdict, details = self.scan_file(file_path)
+            
+            if verdict == ScanVerdict.INFECTED:
+                self._job_manager.update_state(job, JobState.QUARANTINED, {"file": str(file_path), "threat": details})
+                self._job_manager.log_event(job, "SCANNING_THREAT_DETECTED", {"file": str(file_path), "threat": details})
+                return False # Stop on first threat
+            elif verdict == ScanVerdict.ERROR or verdict == ScanVerdict.TIMEOUT:
+                self._job_manager.update_state(job, JobState.FAILED, {"file": str(file_path), "scan_error": details})
+                self._job_manager.log_event(job, "SCANNING_ERROR", {"file": str(file_path), "error": details})
+                return False # Stop on scan error
+            else:
+                self._job_manager.log_event(job, "SCANNING_FILE_CLEAN", {"file": str(file_path), "details": details})
+        
+        self._job_manager.log_event(job, "SCANNING_COMPLETE", {"status": "All files clean"})
         return True
 
-    def _package_job(self, job: Job, file_list: list[Path]):
-        """Encrypts files and creates the final manifest."""
-        self._job_manager.log_event(job, "PACKAGING_START", {"algorithm": "AES-256-GCM"})
+    def _package_job(self, job: Job, file_list: list[Path], drive_letter: str):
+        """Encrypts files and creates the final manifest, writing encrypted data to pendrive."""
+        self._job_manager.log_event(job, "PACKAGING_START", {"algorithm": "AES-256-GCM", "destination": drive_letter})
         
         cek = self._crypto_manager.generate_cek()
-        self._crypto_manager.save_cek_to_disk(cek, job.path / "cek.key") # Insecure, for MVP only
 
-        data_dir = job.path / "data"
-        data_dir.mkdir()
+        # Define pendrive output paths
+        pendrive_output_dir = Path(f"{drive_letter}/.gateway_output")
+        pendrive_data_dir = pendrive_output_dir / "data"
+        pendrive_cek_path = pendrive_output_dir / "cek.key"
+
+        try:
+            pendrive_data_dir.mkdir(parents=True, exist_ok=True)
+            self._crypto_manager.save_cek_to_disk(cek, pendrive_cek_path) # Save CEK to pendrive
+        except Exception as e:
+            self._job_manager.update_state(job, JobState.FAILED, {"error": f"Failed to create output directory or save CEK on pendrive: {e}"})
+            return
         
         file_manifest_data = {}
 
@@ -207,10 +229,14 @@ class FileProcessor:
             ciphertext, nonce, tag = encrypted_data
             
             file_hash = self._crypto_manager.get_sha256_hash(str(file_path).encode('utf-8'))
-            encrypted_file_path = data_dir / file_hash
+            encrypted_file_path_on_pendrive = pendrive_data_dir / file_hash
             
-            with open(encrypted_file_path, 'wb') as f:
-                f.write(ciphertext)
+            try:
+                with open(encrypted_file_path_on_pendrive, 'wb') as f:
+                    f.write(ciphertext)
+            except Exception as e:
+                self._job_manager.update_state(job, JobState.FAILED, {"error": f"Failed to write encrypted file to pendrive: {e}"})
+                return
 
             file_manifest_data[str(file_path)] = {
                 "encrypted_blob_name": file_hash,
@@ -219,15 +245,16 @@ class FileProcessor:
                 "tag": tag.hex()
             }
 
-        # Create the final manifest
+        # Create the final manifest (still written locally for auditing)
         manifest = {
             "job_id": job.job_id,
             "file_count": len(file_list),
             "encryption_algorithm": "AES-256-GCM",
+            "pendrive_output_path": str(pendrive_output_dir),
             "files": file_manifest_data
         }
         self._write_json(job.path / "manifest.json", manifest)
-        self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json"})
+        self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json", "pendrive_output": str(pendrive_output_dir)})
 
     def package_job(self, job: Job, file_list: list[Path]):
         """Public method for job packaging (used by tests)."""

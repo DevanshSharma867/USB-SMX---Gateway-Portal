@@ -1,9 +1,18 @@
 # Handles file enumeration, policy checks, scanning, and packaging.
 import os
 import json
+import subprocess
+from enum import Enum
 from pathlib import Path
 from .job_manager import Job, JobState, JobManager
 from .crypto import CryptoManager
+
+class ScanVerdict(Enum):
+    """Enumeration of possible scan results."""
+    CLEAN = "CLEAN"
+    INFECTED = "INFECTED"
+    ERROR = "ERROR"
+    TIMEOUT = "TIMEOUT"
 
 # MVP Policy: A simple blacklist of file extensions that are not allowed.
 POLICY_BLACKLIST_EXTENSIONS = {".exe", ".dll", ".bat", ".sh"}
@@ -17,6 +26,12 @@ class FileProcessor:
         self._job_manager = job_manager
         self._crypto_manager = CryptoManager()
         self._policies = self._load_policies()
+        # Initialize Windows API for ADS detection
+        try:
+            import ctypes
+            self._kernel32 = ctypes.windll.kernel32
+        except (ImportError, AttributeError):
+            self._kernel32 = None
 
     def _load_policies(self) -> list[dict]:
         """Loads and validates policies from the policy.json file."""
@@ -89,6 +104,10 @@ class FileProcessor:
         except Exception as e:
             self._job_manager.update_state(job, JobState.FAILED, {"error": f"File enumeration failed: {e}"})
             return None
+
+    def enumerate_files(self, job: Job, root_path: str) -> list[Path] | None:
+        """Public method for file enumeration (used by tests)."""
+        return self._enumerate_files(job, root_path)
 
     def _enforce_policies(self, job: Job, file_list: list[Path]) -> bool:
         """Checks files against defined policies. Returns False if a violation occurs."""
@@ -210,7 +229,181 @@ class FileProcessor:
         self._write_json(job.path / "manifest.json", manifest)
         self._job_manager.log_event(job, "PACKAGING_COMPLETE", {"manifest_path": "manifest.json"})
 
+    def package_job(self, job: Job, file_list: list[Path]):
+        """Public method for job packaging (used by tests)."""
+        return self._package_job(job, file_list)
+
     def _write_json(self, file_path: Path, data: dict):
         """Writes a dictionary to a JSON file."""
         with open(file_path, 'w') as f:
             json.dump(data, f, indent=4)
+
+    def scan_file(self, file_path: Path) -> tuple[ScanVerdict, str]:
+        """
+        Scans a single file for malware using available scanners.
+        Returns (verdict, details) tuple.
+        """
+        # Try Microsoft Defender first
+        try:
+            defender_path = self._find_mp_cmd_run()
+            if defender_path:
+                result = subprocess.run([
+                    defender_path, '-Scan', '-ScanType', '3', '-File', str(file_path)
+                ], capture_output=True, text=True, timeout=120)
+                
+                if "Threat found:" in result.stdout or "Threats found:" in result.stdout:
+                    return ScanVerdict.INFECTED, f"Defender: {result.stdout.strip()}"
+                elif result.returncode == 0:
+                    return ScanVerdict.CLEAN, f"Defender: {result.stdout.strip()}"
+                else:
+                    # Check if it's actually clean despite error code
+                    if "Threats found: 0" in result.stdout:
+                        return ScanVerdict.CLEAN, f"Defender: {result.stdout.strip()}"
+                    elif "Threats found:" in result.stdout and "Threats found: 0" not in result.stdout:
+                        return ScanVerdict.INFECTED, f"Defender: {result.stdout.strip()}"
+                    else:
+                        return ScanVerdict.ERROR, f"Defender error: {result.stderr.strip()}"
+        except FileNotFoundError:
+            # Defender not found, try ClamAV
+            pass
+        except subprocess.TimeoutExpired:
+            return ScanVerdict.TIMEOUT, "Defender scan timed out"
+        except subprocess.CalledProcessError as e:
+            if "Threats found: 0" in e.stdout:
+                return ScanVerdict.CLEAN, f"Defender: {e.stdout}"
+            elif "Threats found:" in e.stdout and "Threats found: 0" not in e.stdout:
+                return ScanVerdict.INFECTED, f"Defender: {e.stdout}"
+            else:
+                return ScanVerdict.ERROR, f"Defender error (code {e.returncode}): {e.stderr}"
+        except Exception as e:
+            return ScanVerdict.ERROR, f"Defender error: {str(e)}"
+        
+        # Try ClamAV as fallback
+        try:
+            result = subprocess.run([
+                'clamscan', '--no-summary', str(file_path)
+            ], capture_output=True, text=True, timeout=120)
+            
+            if result.returncode == 1:  # Virus found
+                return ScanVerdict.INFECTED, f"ClamAV: {result.stdout.strip()}"
+            elif result.returncode == 0:  # Clean
+                return ScanVerdict.CLEAN, f"ClamAV: {result.stdout.strip()}"
+            else:
+                return ScanVerdict.ERROR, f"ClamAV error (code {result.returncode}): {result.stderr.strip()}"
+        except FileNotFoundError:
+            return ScanVerdict.CLEAN, "Scanners not found"
+        except subprocess.TimeoutExpired:
+            return ScanVerdict.TIMEOUT, "ClamAV scan timed out"
+        except Exception as e:
+            return ScanVerdict.ERROR, f"ClamAV error: {str(e)}"
+
+    def _find_mp_cmd_run(self) -> str | None:
+        """Finds the path to MpCmdRun.exe."""
+        # Common locations for MpCmdRun.exe
+        possible_paths = [
+            r"C:\Program Files\Windows Defender\MpCmdRun.exe",
+            r"C:\Program Files (x86)\Windows Defender\MpCmdRun.exe",
+        ]
+        
+        # Check if any of the common paths exist
+        for path in possible_paths:
+            if Path(path).exists():
+                return path
+        
+        # Try to find in platform directory
+        try:
+            platform_dir = Path(r"C:\Program Files\Windows Defender\Platform")
+            if platform_dir.exists():
+                for version_dir in platform_dir.iterdir():
+                    if version_dir.is_dir():
+                        mp_cmd_run = version_dir / "MpCmdRun.exe"
+                        if mp_cmd_run.exists():
+                            return str(mp_cmd_run)
+        except Exception:
+            pass
+        
+        return None
+
+    def _is_path_safe(self, path: Path, root: Path) -> bool:
+        """Checks if a path is safe (within root directory, no traversal attacks)."""
+        try:
+            # Check for null bytes and other invalid characters
+            path_str = str(path)
+            if '\x00' in path_str or len(path_str) > 260:
+                return False
+            
+            # Check for path traversal patterns
+            if '..' in path_str or path_str.startswith('/') or '\\' in path_str:
+                # More sophisticated check needed
+                try:
+                    resolved_path = path.resolve()
+                    resolved_root = root.resolve()
+                    
+                    # Check if the resolved path is within the root directory
+                    return str(resolved_path).startswith(str(resolved_root))
+                except (OSError, ValueError):
+                    return False
+            
+            # Resolve the path to handle any symbolic links or relative components
+            resolved_path = path.resolve()
+            resolved_root = root.resolve()
+            
+            # Check if the resolved path is within the root directory
+            return str(resolved_path).startswith(str(resolved_root))
+        except (OSError, ValueError):
+            # If we can't resolve the path, consider it unsafe
+            return False
+
+    def _get_alternate_data_streams(self, file_path: Path) -> list[str]:
+        """Gets alternate data streams for a file (Windows-specific)."""
+        if self._kernel32 is None:
+            return []
+            
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # Windows API constants
+            INVALID_HANDLE_VALUE = -1
+            FILE_ATTRIBUTE_NORMAL = 0x80
+            FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+            
+            # Use the instance variable
+            kernel32 = self._kernel32
+            
+            # Define WIN32_FIND_STREAM_DATA structure
+            class WIN32_FIND_STREAM_DATA(ctypes.Structure):
+                _fields_ = [
+                    ("StreamSize", ctypes.c_ulonglong),
+                    ("cStreamName", ctypes.c_wchar * 260)
+                ]
+            
+            streams = []
+            
+            # Find first stream
+            find_handle = kernel32.FindFirstStreamW(
+                str(file_path),
+                0,  # FindStreamInfoStandard
+                ctypes.byref(WIN32_FIND_STREAM_DATA()),
+                0
+            )
+            
+            if find_handle == INVALID_HANDLE_VALUE:
+                return streams
+            
+            try:
+                while True:
+                    stream_data = WIN32_FIND_STREAM_DATA()
+                    if kernel32.FindNextStreamW(find_handle, ctypes.byref(stream_data)):
+                        stream_name = stream_data.cStreamName
+                        if stream_name and stream_name != "::$DATA":
+                            streams.append(stream_name)
+                    else:
+                        break
+            finally:
+                kernel32.FindClose(find_handle)
+            
+            return streams
+        except Exception:
+            # If we can't enumerate streams, return empty list
+            return []

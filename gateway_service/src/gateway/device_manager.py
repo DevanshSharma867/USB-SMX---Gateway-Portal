@@ -177,11 +177,18 @@ class DeviceManager:
         pythoncom.CoInitialize()
         print("Starting USB device monitor (polling mode)...")
         
-        known_volumes = {}
+        # Initial scan to populate known_volumes with currently connected devices
+        # This ensures existing drives are not treated as new insertions
+        try:
+            wmi_connection = wmi.WMI()
+            known_volumes = {v.DeviceID: v.DriveLetter for v in wmi_connection.Win32_Volume() if v.DriveLetter}
+        except Exception as e:
+            print(f"Error during initial WMI scan: {e}. Starting with empty known volumes.")
+            known_volumes = {} # Fallback if initial scan fails
 
         while not self._stop_event.is_set():
             try:
-                wmi_connection = wmi.WMI()
+                wmi_connection = wmi.WMI() # Re-initialize WMI connection inside loop for robustness
                 current_volumes = {v.DeviceID: v.DriveLetter for v in wmi_connection.Win32_Volume() if v.DriveLetter}
                 
                 current_device_ids = set(current_volumes.keys())
@@ -207,7 +214,7 @@ class DeviceManager:
                         self._handle_device_removal(drive_letter)
 
                 # Update the set of known drives for the next iteration
-                known_volumes = current_volumes
+                known_volumes = current_volumes # This line stays inside the loop
                 
                 self._stop_event.wait(2) # Poll every 2 seconds
 

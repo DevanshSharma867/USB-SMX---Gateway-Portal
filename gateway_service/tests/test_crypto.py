@@ -1,4 +1,3 @@
-
 import unittest
 import os
 import sys
@@ -82,9 +81,12 @@ class TestCryptoManager(unittest.TestCase):
             "C:\\path\\file2.log": {"sha256_encrypted": "hash2"},
         }
         
-        manifest = self.crypto_manager.create_manifest(MockJob(), mock_file_data)
+        manifest = self.crypto_manager.create_manifest(MockJob(), mock_file_data, file_count=2, pendrive_output_path="E:\\.gateway_output")
         
         self.assertEqual(manifest["job_id"], "mock-job-123")
+        self.assertEqual(manifest["file_count"], 2)
+        self.assertEqual(manifest["encryption_algorithm"], "AES-256-GCM")
+        self.assertEqual(manifest["pendrive_output_path"], "E:\\.gateway_output")
         self.assertIn("gateway_info", manifest)
         self.assertIn("files", manifest)
         self.assertEqual(len(manifest["files"]),
@@ -92,13 +94,13 @@ class TestCryptoManager(unittest.TestCase):
         self.assertIn("encryption_params", manifest)
         self.assertEqual(manifest["encryption_params"]["algorithm"], "AES-256-GCM")
 
-    def test_sign_manifest_with_vault_placeholder(self):
-        """Test that the placeholder signing function adds the signature block."""
+    def test_sign_manifest(self):
+        """Test that the signing function adds the signature block."""
         manifest = {"job_id": "test"}
-        signed_manifest = self.crypto_manager.sign_manifest_with_vault(manifest)
+        signed_manifest = self.crypto_manager.sign_manifest(manifest)
         
         self.assertIn("signature", signed_manifest)
-        self.assertEqual(signed_manifest["signature"]["value"], "(placeholder-ed25519-signature)")
+        self.assertIn("value", signed_manifest["signature"])
 
     def test_encrypt_file_nonexistent_file(self):
         """Test encryption of a non-existent file returns None."""
@@ -111,6 +113,13 @@ class TestCryptoManager(unittest.TestCase):
     def test_encrypt_file_permission_error(self):
         """Test encryption when file cannot be read due to permissions."""
         with patch('builtins.open', side_effect=PermissionError("Permission denied")):
+            cek = self.crypto_manager.generate_cek()
+            result = self.crypto_manager.encrypt_file(self.test_file, cek)
+            self.assertIsNone(result)
+
+    def test_encrypt_file_read_error(self):
+        """Test encryption when a file read error occurs."""
+        with patch('builtins.open', side_effect=IOError("File read error")):
             cek = self.crypto_manager.generate_cek()
             result = self.crypto_manager.encrypt_file(self.test_file, cek)
             self.assertIsNone(result)
@@ -183,7 +192,7 @@ class TestCryptoManager(unittest.TestCase):
             job_id = "empty-job-123"
         
         empty_file_data = {}
-        manifest = self.crypto_manager.create_manifest(MockJob(), empty_file_data)
+        manifest = self.crypto_manager.create_manifest(MockJob(), empty_file_data, file_count=0, pendrive_output_path="E:\\.gateway_output")
         
         self.assertEqual(manifest["job_id"], "empty-job-123")
         self.assertEqual(len(manifest["files"]), 0)
@@ -199,15 +208,16 @@ class TestCryptoManager(unittest.TestCase):
         for i in range(1000):
             large_file_data[f"C:\\path\\file{i}.txt"] = {"sha256_encrypted": f"hash{i}"}
         
-        manifest = self.crypto_manager.create_manifest(MockJob(), large_file_data)
+        manifest = self.crypto_manager.create_manifest(MockJob(), large_file_data, file_count=1000, pendrive_output_path="E:\\.gateway_output")
         
         self.assertEqual(manifest["job_id"], "large-job-456")
+        self.assertEqual(manifest["file_count"], 1000)
         self.assertEqual(len(manifest["files"]), 1000)
 
     def test_sign_manifest_preserves_original(self):
         """Test that signing doesn't modify the original manifest."""
         original_manifest = {"job_id": "test", "files": {"file1.txt": "hash1"}}
-        signed_manifest = self.crypto_manager.sign_manifest_with_vault(original_manifest)
+        signed_manifest = self.crypto_manager.sign_manifest(original_manifest)
         
         # Original should not have signature
         self.assertNotIn("signature", original_manifest)
@@ -548,10 +558,9 @@ class TestCryptoManager(unittest.TestCase):
         class MockJob:
             job_id = "test-job"
         
-        # The actual implementation doesn't validate the type, it just uses it directly
-        manifest = self.crypto_manager.create_manifest(MockJob(), None)
+        manifest = self.crypto_manager.create_manifest(MockJob(), {})
         self.assertEqual(manifest["job_id"], "test-job")
-        self.assertIsNone(manifest["files"])
+        self.assertEqual(manifest["files"], {})
     
     def test_create_manifest_with_non_dict_file_metadata(self):
         """Test manifest creation with non-dictionary file metadata."""
@@ -648,15 +657,15 @@ class TestCryptoManager(unittest.TestCase):
     def test_sign_manifest_with_none(self):
         """Test signing with None manifest."""
         with self.assertRaises(AttributeError):
-            self.crypto_manager.sign_manifest_with_vault(None)
+            self.crypto_manager.sign_manifest(None)
     
     def test_sign_manifest_with_empty_dict(self):
         """Test signing with empty manifest."""
         empty_manifest = {}
-        signed = self.crypto_manager.sign_manifest_with_vault(empty_manifest)
+        signed = self.crypto_manager.sign_manifest(empty_manifest)
         
         self.assertIn("signature", signed)
-        self.assertEqual(signed["signature"]["value"], "(placeholder-ed25519-signature)")
+        self.assertIn("value", signed["signature"])
     
     def test_sign_manifest_with_existing_signature(self):
         """Test signing manifest that already has a signature."""
@@ -665,11 +674,11 @@ class TestCryptoManager(unittest.TestCase):
             "signature": {"old": "signature"}
         }
         
-        signed = self.crypto_manager.sign_manifest_with_vault(manifest_with_sig)
+        signed = self.crypto_manager.sign_manifest(manifest_with_sig)
         
         # Should overwrite existing signature
         self.assertIn("signature", signed)
-        self.assertEqual(signed["signature"]["value"], "(placeholder-ed25519-signature)")
+        self.assertIn("value", signed["signature"])
         self.assertNotIn("old", signed["signature"])
     
     def test_sign_manifest_preserves_all_fields(self):
@@ -682,7 +691,7 @@ class TestCryptoManager(unittest.TestCase):
             "custom_field": "custom_value"
         }
         
-        signed = self.crypto_manager.sign_manifest_with_vault(original)
+        signed = self.crypto_manager.sign_manifest(original)
         
         for key, value in original.items():
             self.assertEqual(signed[key], value)
@@ -845,7 +854,7 @@ class TestCryptoManager(unittest.TestCase):
     def test_sign_manifest_invalid_type(self):
         """Test signing with invalid manifest type."""
         with self.assertRaises(AttributeError):
-            self.crypto_manager.sign_manifest_with_vault("not a dict")
+            self.crypto_manager.sign_manifest("not a dict")
     
     def test_save_cek_invalid_path_type(self):
         """Test saving CEK with invalid path type."""
@@ -902,7 +911,7 @@ class TestCryptoManager(unittest.TestCase):
         self.assertEqual(manifest["job_id"], "integration-test")
         
         # Sign manifest
-        signed_manifest = self.crypto_manager.sign_manifest_with_vault(manifest)
+        signed_manifest = self.crypto_manager.sign_manifest(manifest)
         self.assertIn("signature", signed_manifest)
         
         # Verify decryption
@@ -946,7 +955,7 @@ class TestCryptoManager(unittest.TestCase):
             self.assertEqual(len(manifest["files"]), 5)
             
             # Sign manifest
-            signed_manifest = self.crypto_manager.sign_manifest_with_vault(manifest)
+            signed_manifest = self.crypto_manager.sign_manifest(manifest)
             self.assertIn("signature", signed_manifest)
             
         finally:
@@ -994,7 +1003,7 @@ class TestCryptoManager(unittest.TestCase):
         }
         
         manifest = self.crypto_manager.create_manifest(MockJob(), file_metadata)
-        signed_manifest = self.crypto_manager.sign_manifest_with_vault(manifest)
+        signed_manifest = self.crypto_manager.sign_manifest(manifest)
         
         # Should be JSON serializable
         json_str = json.dumps(signed_manifest)

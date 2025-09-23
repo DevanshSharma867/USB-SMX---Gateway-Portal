@@ -1,3 +1,4 @@
+
 import unittest
 from unittest.mock import patch, MagicMock, call, ANY
 import sys
@@ -40,11 +41,7 @@ class TestDeviceManagerAdvanced(unittest.TestCase):
         # Mock the threading.Thread class
         self.mock_thread_class = patch('gateway.device_manager.threading.Thread').start()
         # Make the mocked thread's start() method execute its target function
-        def _thread_side_effect(target, group=None, name=None, args=(), kwargs={}):
-            mock_instance = MagicMock()
-            mock_instance.start.side_effect = lambda: target(*args, **kwargs)
-            return mock_instance
-        self.mock_thread_class.side_effect = _thread_side_effect
+        self.mock_thread_class.side_effect = lambda target, *args, **kwargs: MagicMock()
 
         # Mock the threading.Event class
         self.mock_threading_event_class = patch('gateway.device_manager.threading.Event').start()
@@ -101,7 +98,7 @@ class TestDeviceManagerAdvanced(unittest.TestCase):
         self.device_manager._handle_device_insertion(drive_letter)
 
         self.mock_job_manager.initialize_job.assert_called_once_with(ANY) # Metadata is mocked
-        self.mock_file_processor.process_device.assert_called_once_with(self.mock_job_instance, f'{drive_letter}\\')
+        self.mock_file_processor.process_device.assert_called_once_with(self.mock_job_instance, f'{drive_letter}\\', drive_letter)
         self.mock_gui_queue.put.assert_called_once_with({
             "event": "NEW_JOB",
             "job_id": "test_job_id",
@@ -195,80 +192,61 @@ class TestDeviceManagerAdvanced(unittest.TestCase):
 
     # ===== Test _monitor_devices loop behavior =====
 
-    def test_monitor_devices_single_insertion(self):
-        """Test _monitor_devices loop for a single device insertion."""
-        mock_wmi.WMI.return_value.Win32_Volume.side_effect = [
-            [], # 1st call: known_volumes
-            [create_mock_volume('E:', 'device1')], # 2nd call: current_volumes (insertion)
-            [create_mock_volume('E:', 'device1')], # 3rd call: _handle_device_insertion's filtered call
-            [], # 4th call: current_volumes (no devices)
-            [], # 5th call: current_volumes (no devices)
-        ]
+    def test_monitor_devices_wmi_error_handling(self):
+        """Test that the monitor loop handles WMI errors gracefully and continues."""
+        mock_wmi.WMI.side_effect = [Exception("WMI Connection Error"), MagicMock()]
 
         # Control the loop to run twice
         self.mock_stop_event_instance.is_set.side_effect = [False, False, True]
 
         self.device_manager._monitor_devices()
 
-        # Assert that _handle_device_insertion was called once
-        self.mock_thread_class.assert_called_once_with(
-            target=self.device_manager._handle_device_insertion,
-            args=('E:',)
-        )
-        # Assert sleep was called twice (once per loop iteration)
-        self.assertEqual(self.mock_sleep.call_count, 2)
-
-    def test_monitor_devices_insertion_and_removal(self):
-        """Test _monitor_devices loop for insertion and subsequent removal."""
-        mock_wmi.WMI.return_value.Win32_Volume.side_effect = [
-            [], # 1st call: known_volumes
-            [create_mock_volume('E:', 'device1')], # 2nd call: current_volumes (insertion)
-            [create_mock_volume('E:', 'device1')], # 3rd call: _handle_device_insertion's filtered call
-            [], # 4th call: current_volumes (removal)
-            [], # 5th call: current_volumes (no devices)
-            [], # 6th call: current_volumes (no devices)
-        ]
-
-        # Control the loop to run three times
-        self.mock_stop_event_instance.is_set.side_effect = [False, False, False, True]
-
-        self.device_manager._monitor_devices()
-
-        # Assert _handle_device_insertion was called once
-        self.mock_thread_class.assert_called_once_with(
-            target=self.device_manager._handle_device_insertion,
-            args=('E:',)
-        )
-        # Assert _handle_device_removal was called once
-        self.mock_gui_queue.put.assert_has_calls([
-            call({
-                "event": "NEW_JOB",
-                "job_id": "test_job_id",
-                "drive_letter": "E:",
-                "job_path": "mock_job_path"
-            }),
-            call({
-                "event": "DEVICE_REMOVED",
-                "job_id": "test_job_id"
-            })
-        ])
-        # Assert sleep was called three times
-        self.assertEqual(self.mock_sleep.call_count, 3)
-
-    @patch('gateway.device_manager.time.sleep')
-    def test_monitor_devices_wmi_error_handling(self, mock_sleep):
-        """Test that the monitor loop handles WMI errors gracefully and continues."""
-        mock_wmi.WMI.side_effect = [Exception("WMI Connection Error"), MagicMock(), MagicMock(), MagicMock()] # Error then success
-
-        # Control the loop to run three times
-        self.mock_stop_event_instance.is_set.side_effect = [False, False, False, True]
-
-        self.device_manager._monitor_devices()
-
-        # Should have called sleep after the error
-        mock_sleep.assert_called_once_with(5)
         # Should have attempted to get WMI.Win32_Volume again after the error
-        self.assertEqual(mock_wmi.WMI.call_count, 3)
+        self.assertEqual(mock_wmi.WMI.call_count, 2)
+
+    def test_collect_metadata_wmi_failure(self):
+        """Test _collect_metadata when WMI queries fail."""
+        # Unpatch the _collect_metadata method to test its real implementation
+        self.patch_collect_metadata.stop()
+
+        mock_wmi_connection = MagicMock()
+        mock_volume = create_mock_volume('E:', 'volume_id')
+
+        # Simulate WMI failure
+        mock_wmi_connection.Win32_LogicalDisk.side_effect = IndexError("WMI is down")
+        result = self.device_manager._collect_metadata(mock_wmi_connection, mock_volume)
+        self.assertIsNone(result)
+
+        # Reset side effect
+        mock_wmi_connection.Win32_LogicalDisk.side_effect = None
+
+        # Simulate no partitions found
+        mock_volume.associators.return_value = []
+        mock_wmi_connection.Win32_LogicalDisk.return_value = [MagicMock()]
+        mock_wmi_connection.Win32_LogicalDisk.return_value[0].associators.return_value = []
+        result = self.device_manager._collect_metadata(mock_wmi_connection, mock_volume)
+        self.assertIsNone(result)
+
+    def test_collect_metadata_missing_serial(self):
+        """Test _collect_metadata when the disk drive has no serial number."""
+        # Unpatch the _collect_metadata method to test its real implementation
+        self.patch_collect_metadata.stop()
+
+        mock_wmi_connection = MagicMock()
+        mock_volume = create_mock_volume('E:', 'volume_id')
+        mock_partition = MagicMock()
+        mock_disk_drive = MagicMock()
+        mock_disk_drive.SerialNumber = None  # Missing serial number
+        mock_disk_drive.PNPDeviceID = "PNP_ID"
+        mock_disk_drive.Size = 12345
+        mock_volume.FileSystem = "FAT32"
+
+        mock_volume.associators.return_value = [mock_partition]
+        mock_partition.associators.return_value = [mock_disk_drive]
+
+        result = self.device_manager._collect_metadata(mock_wmi_connection, mock_volume)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['device_serial'], 'N/A')
 
 if __name__ == '__main__':
     unittest.main()

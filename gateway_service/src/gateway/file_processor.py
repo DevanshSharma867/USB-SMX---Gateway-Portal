@@ -27,6 +27,7 @@ class FileProcessor:
         self._crypto_manager = CryptoManager()
         self._policies = self._load_policies()
         self._mp_cmd_run_path = None # Initialize to None
+        self.job = None
         # Initialize Windows API for ADS detection
         try:
             import ctypes
@@ -61,6 +62,7 @@ class FileProcessor:
         """
         Orchestrates the entire file processing pipeline for a given job and device.
         """
+        self.job = job
         try:
             # 1. File Enumeration
             self._job_manager.update_state(job, JobState.ENUMERATING)
@@ -279,12 +281,21 @@ class FileProcessor:
         """
         # Try Microsoft Defender first
         if self._mp_cmd_run_path:
+            command = [self._mp_cmd_run_path, '-Scan', '-ScanType', '3', '-File', str(file_path)]
+            self._job_manager.log_event(self.job, "DEFENDER_SCAN_START", {"command": " ".join(command)})
             try:
-                result = subprocess.run([
-                    self._mp_cmd_run_path, '-Scan', '-ScanType', '3', '-File', str(file_path)
-                ], capture_output=True, text=True, timeout=120)
+                result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+                print(result)
                 
-                if "Threat found:" in result.stdout or "Threats found:" in result.stdout:
+                self._job_manager.log_event(self.job, "DEFENDER_SCAN_COMPLETE", {
+                    "returncode": result.returncode,
+                    "stdout": result.stdout.strip(),
+                    "stderr": result.stderr.strip()
+                })
+
+                if "found 1 threats" in result.stdout and "Cleaning finished" in result.stdout:
+                    return ScanVerdict.INFECTED, f"Defender: {result.stdout.strip()}"
+                elif "Threat found:" in result.stdout or "Threats found:" in result.stdout:
                     return ScanVerdict.INFECTED, f"Defender: {result.stdout.strip()}"
                 elif result.returncode == 0:
                     return ScanVerdict.CLEAN, f"Defender: {result.stdout.strip()}"
@@ -297,11 +308,13 @@ class FileProcessor:
                     else:
                         return ScanVerdict.ERROR, f"Defender error: {result.stderr.strip()}"
             except FileNotFoundError:
-                # This should ideally not happen if _mp_cmd_run_path was found
+                self._job_manager.log_event(self.job, "DEFENDER_SCAN_ERROR", {"error": "MpCmdRun.exe not found at specified path."})
                 pass
             except subprocess.TimeoutExpired:
+                self._job_manager.log_event(self.job, "DEFENDER_SCAN_ERROR", {"error": "Scan timed out."})
                 return ScanVerdict.TIMEOUT, "Defender scan timed out"
             except subprocess.CalledProcessError as e:
+                self._job_manager.log_event(self.job, "DEFENDER_SCAN_ERROR", {"error": f"CalledProcessError: {e.stderr}"})
                 if "Threats found: 0" in e.stdout:
                     return ScanVerdict.CLEAN, f"Defender: {e.stdout}"
                 elif "Threats found:" in e.stdout and "Threats found: 0" not in e.stdout:
@@ -309,9 +322,10 @@ class FileProcessor:
                 else:
                     return ScanVerdict.ERROR, f"Defender error (code {e.returncode}): {e.stderr}"
             except Exception as e:
+                self._job_manager.log_event(self.job, "DEFENDER_SCAN_ERROR", {"error": str(e)})
                 return ScanVerdict.ERROR, f"Defender error: {str(e)}"
         else:
-            print("MpCmdRun.exe path not found. Skipping Defender scan.")
+            self._job_manager.log_event(self.job, "DEFENDER_SCAN_SKIPPED", {"reason": "MpCmdRun.exe path not found."})
         
         # Try ClamAV as fallback
         try:
@@ -334,6 +348,7 @@ class FileProcessor:
 
     def _find_mp_cmd_run(self) -> str | None:
         """Finds the path to MpCmdRun.exe."""
+        self._job_manager.log_event(self.job, "FIND_MPCMDRUN_START", {})
         # Common locations for MpCmdRun.exe
         possible_paths = [
             r"C:\Program Files\Windows Defender\MpCmdRun.exe",
@@ -342,21 +357,28 @@ class FileProcessor:
         
         # Check if any of the common paths exist
         for path in possible_paths:
+            self._job_manager.log_event(self.job, "FIND_MPCMDRUN_CHECKING", {"path": path})
             if Path(path).exists():
+                self._job_manager.log_event(self.job, "FIND_MPCMDRUN_FOUND", {"path": path})
                 return path
         
         # Try to find in platform directory
         try:
             platform_dir = Path(r"C:\Program Files\Windows Defender\Platform")
+            self._job_manager.log_event(self.job, "FIND_MPCMDRUN_CHECKING_PLATFORM", {"platform_dir": str(platform_dir)})
             if platform_dir.exists():
                 for version_dir in platform_dir.iterdir():
                     if version_dir.is_dir():
                         mp_cmd_run = version_dir / "MpCmdRun.exe"
+                        self._job_manager.log_event(self.job, "FIND_MPCMDRUN_CHECKING", {"path": str(mp_cmd_run)})
                         if mp_cmd_run.exists():
+                            self._job_manager.log_event(self.job, "FIND_MPCMDRUN_FOUND", {"path": str(mp_cmd_run)})
                             return str(mp_cmd_run)
-        except Exception:
+        except Exception as e:
+            self._job_manager.log_event(self.job, "FIND_MPCMDRUN_ERROR", {"error": str(e)})
             pass
         
+        self._job_manager.log_event(self.job, "FIND_MPCMDRUN_NOT_FOUND", {})
         return None
 
     def _is_path_safe(self, path: Path, root: Path) -> bool:
